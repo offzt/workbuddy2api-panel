@@ -29,6 +29,8 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -112,6 +114,41 @@ var autoActions = []autoAction{
 		TaskCode: "Expert_team_use_3",
 		Desc:     "真实专家团召唤+使用链 ×3（已验证：三账号点亮）",
 		run:      runExpertTeamUse,
+	},
+	{
+		TaskCode: "expert_use_maidehao",
+		Desc:     "召唤「中国电商运营专家」并对话一次（指定 expertId，expert_actual_use，+50c+5e）",
+		run: func(p *Panel, a *auth.Auth) (string, error) {
+			return runExpertUseTask(p, a, "expert_use_maidehao", "ex_GDl31WahyIH0", "")
+		},
+	},
+	{
+		TaskCode: "expert_use_douyinyin",
+		Desc:     "召唤「抖音策略师」并对话一次（指定 expertId，expert_actual_use，+50c+5e）",
+		run: func(p *Panel, a *auth.Auth) (string, error) {
+			return runExpertUseTask(p, a, "expert_use_douyinyin", "ex_FbY5nlWTqDod", "")
+		},
+	},
+	{
+		TaskCode: "expert_use_shangjia_xuanchuan",
+		Desc:     "召唤「商家宣传页与海报设计师」并对话一次（指定 expertId，expert_actual_use，+50c+5e）",
+		run: func(p *Panel, a *auth.Auth) (string, error) {
+			return runExpertUseTask(p, a, "expert_use_shangjia_xuanchuan", "ex_Weo3x2EZuSDm", "")
+		},
+	},
+	{
+		TaskCode: "expert_use_bowangwang",
+		Desc:     "召唤「直播电商教练」并对话一次（指定 expertId，expert_actual_use，+50c+5e）",
+		run: func(p *Panel, a *auth.Auth) (string, error) {
+			return runExpertUseTask(p, a, "expert_use_bowangwang", "ex_WZY136wV5aMt", "")
+		},
+	},
+	{
+		TaskCode: "WorkBuddy_Valorant",
+		Desc:     "召唤「无畏契约拼豆专家」并对话一次（按名搜 expertId，expert_actual_use，+100c+5e）",
+		run: func(p *Panel, a *auth.Auth) (string, error) {
+			return runExpertUseTask(p, a, "WorkBuddy_Valorant", "", "无畏契约")
+		},
 	},
 	{
 		TaskCode: "Hp_Appearance",
@@ -1103,6 +1140,99 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 	}
 	_ = fail
 	return fmt.Sprintf("已对 %d 位真实专家完成召唤+使用链（类型 %s）", ok, expertType), nil
+}
+
+// expertJumpIDRe 从任务 jump_url 的 deeplink 里抽 expertId。
+//  jump 形如 ...deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_XXXX&buddy_type=workbuddy
+//  expert id 字符（字母数字下划线连字符）不被百分号编码，故解码前后都能匹配。
+var expertJumpIDRe = regexp.MustCompile(`expert[_-]?[Ii]d=([A-Za-z0-9_-]+)`)
+
+// parseExpertIDFromJump 从任务 jump_url 解析指定专家的 expertId（无则返回空）。
+func parseExpertIDFromJump(jump string) string {
+	if jump == "" {
+		return ""
+	}
+	if dec, err := url.QueryUnescape(jump); err == nil {
+		jump = dec
+	}
+	if m := expertJumpIDRe.FindStringSubmatch(jump); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// runExpertUseTask 完成「体验某指定专家」族任务（expert_use_maidehao / expert_use_douyinyin /
+// expert_use_shangjia_xuanchuan / expert_use_bowangwang / WorkBuddy_Valorant）。
+// 与 runExpertBatch 的单次迭代同构（召唤链 → 真实 chat 拿服务端 requestId → expert_actual_use），
+// 但专家 id **固定**为该任务指定专家——服务端按 expert_actual_use 的 expert_id 判进度，
+// 必须是任务对应专家（编造/错配 id 不计数）。
+//
+// expertId 取值优先级：
+//  1. 任务自带 jump_url 的 deeplink（最权威，服务端按它判据）；
+//  2. 调用方给的 fallbackID（从 jump 实测固化，防解析波动）；
+//  3. nameHint 在专家市场按显示名/职业名模糊搜（Valorant 的 jump 不带 id）。
+func runExpertUseTask(p *Panel, a *auth.Auth, code, fallbackID, nameHint string) (string, error) {
+	expertID := fallbackID
+	if t, err := p.taskByCode(a, code); err == nil && t != nil {
+		if id := parseExpertIDFromJump(t.JumpURL); id != "" {
+			expertID = id
+		}
+	}
+	if expertID == "" && nameHint != "" {
+		if experts, err := p.cfg.Upstream.MarketExpertList(a, "agent"); err == nil {
+			for _, e := range experts {
+				if strings.Contains(e.DisplayNameZH, nameHint) || strings.Contains(e.ProfessionZH, nameHint) {
+					expertID = e.ExpertID
+					break
+				}
+			}
+		}
+	}
+	if expertID == "" {
+		return "", fmt.Errorf("未能确定专家 id（code=%s）", code)
+	}
+	return runExpertUseByID(p, a, expertID)
+}
+
+// runExpertUseByID 对**指定** expertId 跑一遍「召唤链 + 真实 chat + expert_actual_use」。
+// 专家条目优先取市场列表真实记录（version/name 以服务端为准），缺失则用最小构造
+// （id 真实存在即可计数，name 仅影响事件可读性）。
+func runExpertUseByID(p *Panel, a *auth.Auth, expertID string) (string, error) {
+	if expertID == "" {
+		return "", fmt.Errorf("缺少专家 id")
+	}
+	e := upstream.MarketExpert{ExpertID: expertID, ExpertType: "agent"}
+	if experts, err := p.cfg.Upstream.MarketExpertList(a, "agent"); err == nil {
+		for _, ex := range experts {
+			if ex.ExpertID == expertID {
+				e = ex
+				break
+			}
+		}
+	}
+	// 召唤链（web_element_click + summon_click + summoned）。
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
+		return "", fmt.Errorf("召唤链: %w", err)
+	}
+	// 真实 chat（带 X-Expert-Id）→ 服务端 requestId（JOIN 事件必须用它）。
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, expertID)
+	if err != nil {
+		return "", fmt.Errorf("真实对话: %w", err)
+	}
+	msgID := "msg-" + expertID
+	if len(req) >= 8 {
+		msgID = "msg-" + req[len(req)-8:]
+	}
+	events := append(upstream.DesktopChatSequence(conv, req, msgID, "fast-model", "fast-model"),
+		upstream.DesktopExpertActualUseEvent(e, conv, req))
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return "", fmt.Errorf("使用事件: %w", err)
+	}
+	name := e.DisplayNameZH
+	if name == "" {
+		name = expertID
+	}
+	return fmt.Sprintf("已上报专家「%s」召唤+使用链（真实对话 requestId）", name), nil
 }
 
 // ---------------------------------------------------------------------------
