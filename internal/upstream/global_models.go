@@ -76,6 +76,10 @@ var globalModelsProbePaths = []string{
 	"/console/enterprises/personal/models",
 }
 
+// errEnterpriseGlobalSkip global 账号跳过企业补缺路探测的哨兵（该企业端点家族在
+// global 域恒 404/500，非真实故障）。下游据此静默降级到 v3 主路，不打诊断日志。
+var errEnterpriseGlobalSkip = fmt.Errorf("enterprise supplemental route unavailable on global realm (skipped by design)")
+
 // FetchGlobalModels 探测 global 账号的模型名目录并返回**模型名列表**（无元数据）。
 //
 // 纯动态：成功返回并集结果（去重），缓存 1h；失败（两路全非 2xx / 解析失败 /
@@ -208,6 +212,15 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	v3CLICh := probeV3(codeBuddyCLIUA)
 	enterpriseCh := make(chan probeResult, 1)
 	go func() {
+		// global 账号的企业端点家族实测恒不可用（2026-11-23 五账号实测：/v2=404
+		// Route Not Found、/console=500 网关错误页，上游根本没有这两个路由），v3/config
+		// 三路才是 global 目录的唯一可靠来源。跳过这 2 次注定失败的请求，直接送一个
+		// 哨兵错误让下游降级到 v3 主路——省请求、省日志，结果与原"补缺路失败"完全一致
+		// （CN 账号不受影响，企业路照常探测补缺）。
+		if a != nil && a.IsGlobal() {
+			enterpriseCh <- probeResult{err: errEnterpriseGlobalSkip}
+			return
+		}
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
 		var lastErr error
 		for _, path := range globalModelsProbePaths {
@@ -249,10 +262,13 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	}
 	if enterprise.err != nil {
 		// 企业端点只是「补缺路」（补 gpt-5.3-codex 等 v3 主路可能缺失的 id）。能走到
-		// 这里说明 v3 主路已成功（两路全失败在上方已返回，v3 失败也已提前返回），
-		// 上游网关对该可选路径返回 500（如 openresty 错误页）属预期降级、不影响功能，
-		// 故按 info 诊断日志而非 WARN——避免把正常降级误报成告警。
-		log.Printf("[upstream] global models: 企业补缺端点不可用，v3 主路已覆盖（40+ 模型，功能不受影响），跳过补缺: %v", enterprise.err)
+		// 这里说明 v3 主路已成功（两路全失败在上方已返回，v3 失败也已提前返回）。
+		// 两种情况静默降级到 v3：① global 账号本就跳过该路（哨兵，恒不可用）；
+		// ② 上游网关对该可选路径返回 500（openresty 错误页）——都属预期、不影响功能，
+		// 不重复打日志避免噪音（CC 侧同样静默）。
+		if enterprise.err != errEnterpriseGlobalSkip {
+			log.Printf("[upstream] global models: 企业补缺端点不可用，v3 主路已覆盖（功能不受影响），跳过补缺: %v", enterprise.err)
+		}
 		names, infos, efforts, defaults = extractEfforts(v3.infos)
 		return names, infos, efforts, defaults, nil
 	}
@@ -669,4 +685,135 @@ func parseGlobalModelLoose(obj map[string]any) (ModelInfo, bool) {
 		}
 	}
 	return mi, true
+}
+
+// ---------------------------------------------------------------------------
+// 端点可用性诊断（一次性工具 cmd/probeendpoints 使用；导出供外部遍历账号调用）
+// ---------------------------------------------------------------------------
+
+// EndpointProbe 单个 (端点 × UA) 组合的实测结果。
+type EndpointProbe struct {
+	Endpoint  string `json:"endpoint"` // 路径，如 /v3/config
+	UA        string `json:"ua"`       // 该次请求使用的 User-Agent
+	Base      string `json:"base"`     // 按 realm 切的 base host
+	Status    int    `json:"status"`   // HTTP 状态码（0=传输层失败）
+	Models    int    `json:"models"`   // 解析出的模型条数（0 可能是空/解析失败）
+	OK        bool   `json:"ok"`       // 200 且模型数 > 0
+	ElapsedMS int64  `json:"elapsed_ms"`
+	Err       string `json:"err,omitempty"` // 错误/非 2xx 的 body 摘要
+}
+
+// ProbeModelEndpoints 对单个账号实测所有模型目录端点组合（企业家族 + v3/config 三路 UA），
+// 返回逐项结果。只读探测，不改缓存/不改账号状态；token 过期会如实反映为 401/403。
+// 用于一次性摸清"哪些端点可用"，不参与正常请求路径。
+func (c *Client) ProbeModelEndpoints(a *auth.Auth) []EndpointProbe {
+	base := c.ChatBaseCN
+	if a != nil && a.IsGlobal() {
+		base = c.globalChatBase()
+	}
+	// 探测矩阵：(路径, UA)。企业端点用默认 UA；v3/config 三路 UA 各下发不同模型集。
+	type combo struct{ path, ua string }
+	combos := []combo{
+		{"/v2/enterprises/personal/models", ""},
+		{"/console/enterprises/personal/models", ""},
+		{"/v3/config", c.defaultWorkBuddyUAFor(a)}, // desktop 主路
+		{"/v3/config", codeBuddyIDEUA},
+		{"/v3/config", codeBuddyCLIUA},
+	}
+	out := make([]EndpointProbe, 0, len(combos))
+	for _, cb := range combos {
+		pr := EndpointProbe{Endpoint: cb.path, Base: base}
+		ua := cb.ua
+		if ua == "" {
+			ua = c.userAgent(a)
+		}
+		pr.UA = ua
+		start := time.Now()
+		req, err := http.NewRequest(http.MethodGet, base+cb.path, nil)
+		if err != nil {
+			pr.Err = err.Error()
+			pr.ElapsedMS = time.Since(start).Milliseconds()
+			out = append(out, pr)
+			continue
+		}
+		// 打底头（Origin/Referer/UA/X-CodeBuddy-Request/设备指纹），再覆盖本组合 UA。
+		c.CommonHeaders(req, a)
+		req.Header.Set("User-Agent", ua)
+		req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+		if a != nil && a.UID != "" {
+			req.Header.Set("X-User-Id", a.UID)
+		}
+		req.Header.Set("X-Domain", base)
+		req.Header.Set("X-Product", "SaaS")
+		// v3/config 对 UA 敏感且要 IDE 形态 Accept；企业端点保持 json。
+		if cb.path == "/v3/config" {
+			req.Header.Set("Accept", "application/json, text/plain, */*")
+		}
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			pr.Err = err.Error()
+			pr.ElapsedMS = time.Since(start).Milliseconds()
+			out = append(out, pr)
+			continue
+		}
+		pr.Status = resp.StatusCode
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		resp.Body.Close()
+		pr.ElapsedMS = time.Since(start).Milliseconds()
+		if rerr != nil {
+			pr.Err = "read body: " + rerr.Error()
+			out = append(out, pr)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			pr.Err = truncate(string(raw), 100)
+			out = append(out, pr)
+			continue
+		}
+		pr.Models = countProbeModels(raw)
+		pr.OK = pr.Models > 0
+		if !pr.OK {
+			pr.Err = "200 but 0 models / parse failed: " + truncate(string(raw), 100)
+		}
+		out = append(out, pr)
+	}
+	return out
+}
+
+// countProbeModels 宽松数出响应里的模型条数：优先 data.models / models / data.items / data.list
+// 数组长度；都不命中时退化为顶层任意数组长度。仅用于诊断展示，不产出 ModelInfo。
+func countProbeModels(raw []byte) int {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(raw, &root) != nil {
+		return 0
+	}
+	payload := json.RawMessage(raw)
+	if d, ok := root["data"]; ok {
+		t := strings.TrimSpace(string(d))
+		if t != "" && t != "null" {
+			payload = d
+		}
+	}
+	countArr := func(rm json.RawMessage) int {
+		var arr []json.RawMessage
+		if json.Unmarshal(rm, &arr) == nil {
+			return len(arr)
+		}
+		return 0
+	}
+	for _, key := range []string{"models", "items", "list", "data", "result"} {
+		var m map[string]json.RawMessage
+		if json.Unmarshal(payload, &m) == nil {
+			if v, ok := m[key]; ok {
+				if n := countArr(v); n > 0 {
+					return n
+				}
+			}
+		}
+	}
+	// payload 自身是数组
+	if n := countArr(payload); n > 0 {
+		return n
+	}
+	return 0
 }
