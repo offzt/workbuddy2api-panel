@@ -248,7 +248,11 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		return names, infos, efforts, defaults, nil
 	}
 	if enterprise.err != nil {
-		log.Printf("WARN: [upstream] global models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
+		// 企业端点只是「补缺路」（补 gpt-5.3-codex 等 v3 主路可能缺失的 id）。能走到
+		// 这里说明 v3 主路已成功（两路全失败在上方已返回，v3 失败也已提前返回），
+		// 上游网关对该可选路径返回 500（如 openresty 错误页）属预期降级、不影响功能，
+		// 故按 info 诊断日志而非 WARN——避免把正常降级误报成告警。
+		log.Printf("[upstream] global models: 企业补缺端点不可用，v3 主路已覆盖（40+ 模型，功能不受影响），跳过补缺: %v", enterprise.err)
 		names, infos, efforts, defaults = extractEfforts(v3.infos)
 		return names, infos, efforts, defaults, nil
 	}
