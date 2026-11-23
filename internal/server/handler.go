@@ -1271,7 +1271,9 @@ func rotateBackoff(i int, ctx context.Context) bool {
 		return ctx.Err() == nil
 	}
 	if !sleepCtx(ctx, d) {
-		log.Printf("WARN: [server] rotate backoff aborted: ctx cancelled")
+		// ctx 取消只可能是客户端断连或优雅停机（调用方一律传 r.Context()）——客户端
+		// 已走，退避中止是预期行为，按 INFO 记录，避免把日常断连报成 WARN 噪音。
+		log.Printf("INFO: [server] rotate backoff aborted: ctx cancelled")
 		return false
 	}
 	return true

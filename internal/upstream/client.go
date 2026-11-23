@@ -1119,7 +1119,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			resp, err := c.chatHTTP().Do(req)
 			if err != nil {
 				cancel()
-				log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
+				// 客户端主动断连（父 ctx 取消）导致的 Do 取消是日常正常事件，按 INFO
+				// 记录，避免伪装成 ERR 污染错误日志/误导排障；真实传输错误仍按 ERR。
+				// 判定：err 是 context.Canceled 且调用方 ctx 确已取消（区分于我们自己的
+				// 看门狗或底层网络取消）。错误返回/轮转语义一律不变，仅日志级别。
+				if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+					log.Printf("INFO: [upstream] chat_stream acct=%s: 客户端断连，上游请求取消: %v", logfmt.Label(a.UID, a.Nickname), err)
+				} else {
+					log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
+				}
 				// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
 				// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
 				// 不够，主动清池才断根。
